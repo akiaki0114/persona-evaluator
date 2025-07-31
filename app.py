@@ -1,56 +1,57 @@
-import streamlit as st
-import pandas as pd
-import requests
-from io import BytesIO
-from openai import OpenAI
-from dotenv import load_dotenv
-import os
-import certifi
-import pdfplumber
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from serpapi import GoogleSearch
-from generate_pdf_report import generate_pdf_report
-import re
 
+import streamlit as st
+import os
+import requests
+from bs4 import BeautifulSoup
+import certifi
+from urllib.parse import urlparse, urljoin
+from dotenv import load_dotenv
+from openai import OpenAI
+import pdfplumber
+import pandas as pd
+
+
+# === 👤 ログイン認証の追加 ===
+import streamlit as st
+
+USERNAME = "admin"
+PASSWORD = "DDmirai2025!"
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔒 ログイン")
+    username = st.text_input("ユーザー名")
+    password = st.text_input("パスワード", type="password")
+    if st.button("ログイン"):
+        if username == USERNAME and password == PASSWORD:
+            st.session_state.authenticated = True
+        else:
+            st.error("ユーザー名またはパスワードが違います")
+    st.stop()  # ログインしてない限り以降は描画されない
+
+
+# === 初期設定 ===
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-def run_with_spinner(label, func, *args, **kwargs):
-    with st.spinner(label):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            st.error(f"{label} でエラー: {e}")
-            return None
-
-def get_official_site(company_name):
-    search = GoogleSearch({
-        "q": f"{company_name} 公式サイト",
-        "hl": "ja",
-        "api_key": os.getenv("SERPAPI_KEY")
-    })
-    results = search.get_dict()
-    try:
-        return results["organic_results"][0]["link"]
-    except (KeyError, IndexError):
-        return ""
-
+# === 各種関数 ===
 def fetch_website_text(url):
     try:
         res = requests.get(url, timeout=5, verify=certifi.where())
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
-        for script in soup(["script", "style"]):
-            script.decompose()
+        for tag in soup(["script", "style"]):
+            tag.decompose()
         lines = [line.strip() for line in soup.get_text(separator="\n").splitlines()]
         return "\n".join(line for line in lines if line)
     except Exception as e:
         st.warning(f"{url} 取得失敗: {e}")
         return ""
 
-def fetch_all_texts(base_url, max_pages=10):
+def fetch_all_texts(base_url, max_pages=5):
     visited, to_visit, all_texts = set(), [base_url], []
     domain = urlparse(base_url).netloc
     while to_visit and len(visited) < max_pages:
@@ -63,13 +64,13 @@ def fetch_all_texts(base_url, max_pages=10):
             all_texts.append(text[:5000])
         try:
             res = requests.get(current_url, timeout=5, verify=certifi.where())
-            res.encoding = res.apparent_encoding
             soup = BeautifulSoup(res.text, 'html.parser')
             for a in soup.find_all("a", href=True):
                 href = a['href']
                 new_url = urljoin(base_url, href)
-                if urlparse(new_url).netloc == domain and new_url not in visited and new_url not in to_visit:
-                    to_visit.append(new_url)
+                if urlparse(new_url).netloc == domain:
+                    if new_url not in visited and new_url not in to_visit:
+                        to_visit.append(new_url)
         except Exception:
             continue
     return "\n\n".join(all_texts)
@@ -84,299 +85,197 @@ def extract_text_from_pdf(uploaded_pdf):
         st.warning(f"PDF解析失敗: {e}")
     return text
 
-def generate_personas(company_name, combined_text):
+def suggest_segments_from_text(company_name, combined_text, issue_text, num_segments):
     prompt = f"""
-あなたはトップ戦略コンサルタント兼マーケターです。
-以下の情報を元に、この会社の顧客（消費者または取引先）としてのペルソナを4人作成してください。
+あなたは優秀なマーケティングコンサルタントです。
+以下の企業情報と、既存事業の課題に基づいて、マーケティング的に有望と思われる顧客セグメントを{num_segments}個、【セグメント名 + その理由】の形式で提案してください。
 
-重要:
-- {company_name} の社員や関係者は含めない。
-- あくまでこの会社の商品・サービスを利用する顧客像です。
+# 出力フォーマット
+1. セグメント名：〇〇〇〇
+   理由：〇〇〇〇
+2. セグメント名：・・・
+   理由：・・・
 
 # 会社名
 {company_name}
 
-# Webサイト情報 + PDF資料
+# 企業情報
 {combined_text}
 
-## ペルソナ1〜4
-- 名前
-- 年齢, 性別, 職業, 性格, 家族構成, 趣味・価値観, 日常の悩み,
-  サービス利用シーン, 解決したい課題, どこに最も価値を感じるか,
-  情報収集チャネル, 購買決定プロセス, 競合サービス利用状況,
-  価格感度, 導入後期待ROI, 長期ビジョン
+# 既存事業の課題
+{issue_text}
 """
-    response = client.chat.completions.create(
+    res = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content
+    return res.choices[0].message.content
 
-def generate_persona_image(persona_desc):
+def generate_persona_for_segment(company_name, combined_text, segment_description, issue_text):
     prompt = f"""
-{persona_desc} を参考にした30-50代ビジネスパーソンの顧客の日常風景のスナップ。
-自然光、生活感のある背景、リラックスした表情。
-リアルな質感、文字やラベルなし、広告ではなくドキュメンタリー風。
-"""
-    img = client.images.generate(
-        model="dall-e-3",
-        prompt=prompt,
-        size="1024x1024"
-    )
-    return img.data[0].url
+あなたはプロのマーケティングコンサルタントです。
+以下の企業情報と事業課題に基づき、指定されたセグメントに沿って、戦略的に有効なペルソナを1人作成してください。
 
-def evaluate_persona_score(persona, idea_name, idea_content):
-    prompt = f"""
-あなたはペルソナ本人の気持ちになりきって、下記の事業アイデアを「自分なら本当に使いたいか/生活がどう広がるか」の観点で現実的に評価してください。
-100点満点で点数をつけ、その理由を1文で述べてください。
-点数は広がりを持たせて（高得点も時々出るイメージで）、忖度せずに正直に、なるべく生活の中での利用イメージと広がりまで想像して回答してください。
-
-# ペルソナ
-{persona}
-
-# 事業アイデア
-名称: {idea_name}
-内容: {idea_content}
-
-# 出力フォーマット
-- スコア（100点満点・数字のみ）
-- 理由（1文、利用シーンの想像・生活への広がりを踏まえて）
-"""
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
-
-def evaluate_strategy_multiaxis(company_name, idea_name, idea_content):
-    prompt = f"""
-あなたは極めて現実的な戦略コンサルタントです。
-下記の事業アイデアを「市場性」「競争優位性」「収益性」「実現可能性」「成長性」の5軸で100点満点で評価し、それぞれ理由を簡潔に述べてください。
-表記ゆれなく必ず下記フォーマット通り、点数と理由を出力してください。
+# セグメント
+{segment_description}
 
 # 会社名
 {company_name}
 
+# 企業情報（Web/PDF）
+{combined_text}
+
+# 既存事業の課題
+{issue_text}
+
+# 出力フォーマット（この構成・順番を厳守）
+- 名前: 
+- 年齢, 性別, 職業: 
+- 性格: 
+- 家族構成: 
+- ライフスタイル: 
+- 趣味・価値観: 
+- 日常の悩み: 
+- サービス利用シーン: 
+- 解決したい課題: 
+- どこに価値を感じるか: 
+- 情報収集チャネル: 
+- 購買決定プロセス: 
+- 競合サービス: 
+- 価格感度: 
+- 導入期待効果: 
+- 将来展望: 
+"""
+    res = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return res.choices[0].message.content
+
+def evaluate_persona_score(persona_text, idea_name, idea_desc):
+    prompt = f"""
+あなたはマーケティングリサーチの専門家です。
+以下のペルソナと事業アイデアの内容を読み、このアイデアがこの人物にとって魅力的かどうかを5段階で評価してください。
+
+# ペルソナ
+{persona_text}
+
 # 事業アイデア
 名称: {idea_name}
-内容: {idea_content}
+内容: {idea_desc}
 
 # 出力フォーマット
-- 市場性: xx点（理由: 〜〜〜）
-- 競争優位性: xx点（理由: 〜〜〜）
-- 収益性: xx点（理由: 〜〜〜）
-- 実現可能性: xx点（理由: 〜〜〜）
-- 成長性: xx点（理由: 〜〜〜）
+- 評価スコア（1〜5）: 
+- 理由（100文字程度）:
 """
-    response = client.chat.completions.create(
+    res = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content
+    return res.choices[0].message.content
 
-def generate_new_potential_personas(company_name, existing_personas, idea_name, idea_content):
-    persona_list_str = "\n".join([p[:400] for p in existing_personas])
-    prompt = f"""
-あなたはトップ戦略コンサルタントです。
-下記の事業アイデアは、これまでの顧客層にはリーチしていなかった“新たな潜在顧客層”の開拓にもつながる可能性があります。
+# === UI ===
+st.title("🧩 ペルソナ生成 ＋ 事業評価ツール")
 
-# 事業アイデア
-名称: {idea_name}
-内容: {idea_content}
+company_name = st.text_input("① 企業名")
+website_url = st.text_input("② WebサイトURL（任意）")
+uploaded_pdfs = st.file_uploader("③ PDF資料アップロード（任意）", type=["pdf"], accept_multiple_files=True)
+issue_text = st.text_area("④ 既存事業の課題")
 
-# 既存顧客ペルソナ一覧
-{persona_list_str}
+persona_mode = st.radio("⑤ ペルソナ生成モード", ["ユーザーがセグメントを指定", "AIがセグメントを自動提案"])
+num_personas = st.slider("⑥ 各セグメントごとのペルソナ人数", 1, 3, 1)
+num_segments_to_suggest = st.slider("⑦ 提案セグメント数（AI使用時）", 1, 6, 4)
 
-絶対条件:
-- {company_name}の社員や関係者は含めないこと
-- 既存ペルソナと属性や特徴が重複しない、新たな顧客層（潜在ニーズ）を2名分
+if "segments" not in st.session_state:
+    st.session_state.segments = ""
+if "confirmed" not in st.session_state:
+    st.session_state.confirmed = False
+if "parsed_segments" not in st.session_state:
+    st.session_state.parsed_segments = []
+if "personas" not in st.session_state:
+    st.session_state.personas = []
+if "ideas" not in st.session_state:
+    st.session_state.ideas = []
 
-## ペルソナ出力フォーマット
-- 名前
-- 年齢・性別・職業・価値観・日常の悩み・このアイデアで惹かれる理由
-"""
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
+if persona_mode == "ユーザーがセグメントを指定":
+    st.session_state.segments = st.text_area("⑧ セグメントを1行ずつ入力", height=150)
+    if st.session_state.segments:
+        st.session_state.confirmed = True
 
-def extract_persona_names(persona_list):
-    names = []
-    for persona in persona_list:
-        m = re.search(r'名前[:：]\s*([^\n]+)', persona)
-        if m:
-            names.append(m.group(1).strip())
-        else:
-            m2 = re.search(r'[:：]\s*([^\s（\(\-]+)', persona.split('\n')[0])
-            if m2:
-                names.append(m2.group(1))
-            else:
-                names.append(f"ペルソナ{len(names)+1}")
-    return names
-
-st.title("顧客ペルソナ×事業アイデア評価ツール")
-
-# STEP 1
-st.header("STEP 1: 企業情報")
-col1, col2 = st.columns(2)
-company_name = col1.text_input("① 企業名（例: 三越伊勢丹）")
-manual_url = col2.text_input("② URLを直接指定")
-uploaded_pdf = st.file_uploader("③ 中期経営計画や決算資料などのPDFアップロード（任意・複数可）", type=["pdf"], accept_multiple_files=True)
-generate_images = st.checkbox("ペルソナイメージも生成する")
-
-if st.button("🚀 STEP1: ペルソナを生成スタート"):
+if persona_mode == "AIがセグメントを自動提案" and st.button("🔍 AIにセグメントを提案してもらう"):
     combined_text = ""
-    url = get_official_site(company_name) if company_name and not manual_url else manual_url
-    if url:
-        web_text = run_with_spinner("複数ページクロール中...", fetch_all_texts, url)
-        combined_text += web_text + "\n"
+    if website_url:
+        combined_text += fetch_all_texts(website_url)
+    if uploaded_pdfs:
+        for pdf in uploaded_pdfs:
+            combined_text += extract_text_from_pdf(pdf)
+    if company_name and issue_text and combined_text:
+        raw_output = suggest_segments_from_text(company_name, combined_text, issue_text, num_segments_to_suggest)
 
-    if uploaded_pdf:
-        for pdf_file in uploaded_pdf:
-            pdf_text = run_with_spinner(f"{pdf_file.name} を解析中...", extract_text_from_pdf, pdf_file)
-            combined_text += pdf_text + "\n"
+        parsed_segments = []
+        for block in raw_output.strip().split("\n"):
+            if "セグメント名：" in block:
+                name = block.replace("セグメント名：", "").strip()
+                parsed_segments.append({"name": name, "reason": ""})
+            elif "理由：" in block and parsed_segments:
+                parsed_segments[-1]["reason"] = block.replace("理由：", "").strip()
 
-    combined_text = combined_text[:60000]
+        st.session_state.segments = "\n".join([seg["name"] for seg in parsed_segments])
+        st.session_state.parsed_segments = parsed_segments
+        st.session_state.confirmed = False
+        st.success("AIによるセグメント提案が完了しました。編集後に確定してください。")
 
-    if combined_text:
-        personas_text = run_with_spinner("ペルソナ生成中...", generate_personas, company_name or manual_url, combined_text)
-        if not personas_text:
-            st.error("ペルソナ生成に失敗しました。もう一度試してください。")
-        else:
-            persona_list = personas_text.split("## ペルソナ")[1:]
-            persona_images, persona_images_bytes = [], []
-            for i, persona in enumerate(persona_list, start=1):
-                if generate_images:
-                    img_url = run_with_spinner(f"ペルソナ{i} のイメージ生成中...", generate_persona_image, persona)
-                    persona_images.append(img_url)
-                    try:
-                        img_bytes = requests.get(img_url, verify=False).content
-                        persona_images_bytes.append(BytesIO(img_bytes))
-                    except Exception as e:
-                        st.warning(f"画像ダウンロード失敗: {e}")
-                        persona_images_bytes.append(None)
-                else:
-                    persona_images.append(None)
-                    persona_images_bytes.append(None)
-            st.session_state["persona_list"] = persona_list
-            st.session_state["persona_images"] = persona_images
-            st.session_state["persona_images_bytes"] = persona_images_bytes
-            st.success("✅ ペルソナ生成完了！")
-    else:
-        st.warning("企業情報（Web / PDF）を入力してください。")
+if st.session_state.parsed_segments and not st.session_state.confirmed:
+    st.markdown("### 🤖 AIが提案したセグメント（理由つき）")
+    for i, seg in enumerate(st.session_state.parsed_segments, 1):
+        st.markdown(f"**{i}. {seg['name']}**  \n📝 理由: {seg['reason']}")
 
-if "persona_list" in st.session_state:
-    st.header("【生成されたペルソナ】")
-    persona_names = extract_persona_names(st.session_state["persona_list"])
-    for i, (persona, img_url, name) in enumerate(zip(st.session_state["persona_list"], st.session_state["persona_images"], persona_names), start=1):
-        cols = st.columns([1,3])
-        with cols[0]:
-            if img_url:
-                st.image(img_url, caption=f"{name}")
-        with cols[1]:
-            st.text(persona.strip()[:1000] + "...")
+if st.session_state.segments and not st.session_state.confirmed:
+    st.text_area("📝 編集可能なセグメント一覧（1行ずつ）", value=st.session_state.segments, height=150, key="segments_editable")
+    if st.button("✅ 編集済みセグメントを確定"):
+        st.session_state.segments = st.session_state.segments_editable
+        st.session_state.confirmed = True
+        st.success("セグメントを確定しました。")
 
-# STEP 2
-st.header("STEP 2: 事業アイデア入力（複数可）")
-if "idea_texts" not in st.session_state:
-    st.session_state["idea_texts"] = [("", "")]
-if "add_idea_flag" not in st.session_state:
-    st.session_state.add_idea_flag = False
+# ペルソナ生成
+if st.session_state.segments and st.session_state.confirmed and st.button("🚀 ペルソナ生成を実行"):
+    combined_text = ""
+    if website_url:
+        combined_text += fetch_all_texts(website_url)
+    if uploaded_pdfs:
+        for pdf in uploaded_pdfs:
+            combined_text += extract_text_from_pdf(pdf)
+    st.session_state.personas = []
+    for seg in st.session_state.segments.split("\n"):
+        for i in range(num_personas):
+            persona = generate_persona_for_segment(company_name, combined_text, seg, issue_text)
+            st.session_state.personas.append({"segment": seg, "text": persona})
 
-uploaded_file = st.file_uploader("CSVアップロード（事業アイデア名, 事業内容）", type=["csv"])
-ideas = []
+# CSVアップロードと事業評価制御
+uploaded_csv = st.file_uploader("CSVアップロード（事業アイデア名, 事業内容）", type="csv")
+if uploaded_csv:
+    if st.button("📥 CSVから事業アイデアを読み込む"):
+        df = pd.read_csv(uploaded_csv)
+        for _, row in df.iterrows():
+            st.session_state.ideas.append({
+                "name": row["事業アイデア名"],
+                "desc": row["事業内容"]
+            })
+        st.success("CSVから事業アイデアを読み込みました。")
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    for _, row in df.iterrows():
-        ideas.append((row["事業アイデア名"], row["事業内容"]))
-else:
-    for i, (name, content) in enumerate(st.session_state["idea_texts"]):
-        name = st.text_input(f"事業アイデア{i+1} 名称", value=name, key=f"idea_name_{i}")
-        content = st.text_area(f"事業アイデア{i+1} 内容", value=content, key=f"idea_content_{i}")
-        st.session_state["idea_texts"][i] = (name, content)
+idea_name = st.text_input("🆕 事業アイデア名")
+idea_desc = st.text_area("📝 事業内容", height=120)
+if st.button("➕ アイデア追加"):
+    if idea_name and idea_desc:
+        st.session_state.ideas.append({"name": idea_name, "desc": idea_desc})
+        st.success("事業アイデアを追加しました。")
 
-    if st.button("事業アイデアを追加"):
-        st.session_state.add_idea_flag = True
-
-    if st.session_state.add_idea_flag:
-        st.session_state["idea_texts"].append(("", ""))
-        st.session_state.add_idea_flag = False
-        st.rerun()
-
-    ideas = [idea for idea in st.session_state["idea_texts"] if idea[0] and idea[1]]
-
-if st.button("🚀 STEP2: 全アイデアを評価"):
-    persona_list = st.session_state.get("persona_list", [])
-    persona_images_bytes = st.session_state.get("persona_images_bytes", [])
-    persona_names = extract_persona_names(persona_list)
-    if persona_list and ideas:
-        records = []
-        strategy_eval_dict = {}
-        new_potential_personas_dict = {}
-        for idea_name, idea_content in ideas:
-            result_row = {"事業アイデア名": idea_name}
-            # 各ペルソナ受容性評価
-            for i, persona in enumerate(persona_list, start=1):
-                eval_result = run_with_spinner(f"{idea_name} × {persona_names[i-1]} 受容性評価中...", evaluate_persona_score, "## ペルソナ"+persona, idea_name, idea_content)
-                try:
-                    score_line = next(line for line in eval_result.splitlines() if "スコア" in line or "点" in line)
-                    score = re.search(r'(\d+)', score_line).group(1)
-                except Exception:
-                    score = "N/A"
-                try:
-                    reason_line = next(line for line in eval_result.splitlines() if "理由" in line)
-                    reason = reason_line.split(":")[-1].strip()
-                except StopIteration:
-                    reason = ""
-                result_row[f"ペルソナ{i}スコア"] = score
-                result_row[f"ペルソナ{i}理由"] = reason
-
-            # 多軸戦略評価
-            multi_eval_result = run_with_spinner(f"{idea_name} 多軸戦略評価中...", evaluate_strategy_multiaxis, company_name, idea_name, idea_content)
-            strategy_eval_dict[idea_name] = multi_eval_result
-
-            # 新規潜在顧客ペルソナ生成
-            new_persona_text = run_with_spinner(
-                f"{idea_name}向け 新規潜在顧客ペルソナ生成中...",
-                generate_new_potential_personas, company_name, persona_list, idea_name, idea_content
-            )
-            new_potential_personas_dict[idea_name] = new_persona_text
-            records.append(result_row)
-
-        df = pd.DataFrame(records)
-        st.session_state["result_df"] = df
-        st.session_state["latest_persona_list"] = persona_list
-        st.session_state["latest_persona_images_bytes"] = persona_images_bytes
-        st.session_state["new_potential_personas"] = new_potential_personas_dict
-        st.session_state["strategy_eval_dict"] = strategy_eval_dict
-        st.dataframe(df)
-        st.header("【多軸戦略評価】")
-        for idea_name, eval_text in strategy_eval_dict.items():
-            st.markdown(f"### ■ {idea_name}")
-            st.markdown(f"<pre>{eval_text}</pre>", unsafe_allow_html=True)
-        st.header("【新規潜在顧客ペルソナ】")
-        for idea_name, new_pers in new_potential_personas_dict.items():
-            st.markdown(f"### ■ {idea_name}")
-            st.markdown(f"<pre>{new_pers}</pre>", unsafe_allow_html=True)
-    else:
-        st.warning("まずSTEP1を実行しペルソナを生成してください。")
-
-if "result_df" in st.session_state and not st.session_state["result_df"].empty:
-    st.header("【ダウンロード】")
-    if st.button("PDFをダウンロード"):
-        pdf = generate_pdf_report(
-            st.session_state["latest_persona_list"],
-            st.session_state["result_df"],
-            company_name or "manual",
-            st.session_state["latest_persona_images_bytes"],
-            st.session_state.get("new_potential_personas", None),
-            st.session_state.get("strategy_eval_dict", None),
-        )
-        st.download_button("📄 PDFダウンロード", data=pdf, file_name=f"{company_name or 'manual'}_評価レポート.pdf", mime="application/pdf")
-    if st.button("CSVをダウンロード"):
-        csv = st.session_state["result_df"].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button("CSVダウンロード（UTF-8 Excel対応）", data=csv, file_name=f"{company_name or 'manual'}_評価結果.csv", mime='text/csv')
-else:
-    st.info("まず全アイデア評価を実行してください。")
+# 評価ボタン表示
+if st.session_state.personas and st.session_state.ideas:
+    if st.button("🧠 ペルソナごとの事業評価を実行"):
+        for persona in st.session_state.personas:
+            st.subheader(f"🎯 {persona['segment']} 向けペルソナの評価")
+            for idea in st.session_state.ideas:
+                result = evaluate_persona_score(persona["text"], idea["name"], idea["desc"])
+                st.markdown(f"**📝 アイデア名：{idea['name']}**")
+                st.code(result)
