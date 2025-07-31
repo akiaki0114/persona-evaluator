@@ -8,3 +8,4 @@ python-dotenv
 pdfplumber
 pandas
 certifi
+google-search-results
