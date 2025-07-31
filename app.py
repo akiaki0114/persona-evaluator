@@ -211,7 +211,7 @@ if persona_mode == "AIがセグメントを自動提案" and st.button("🔍 AI�
     if uploaded_pdfs:
         for pdf in uploaded_pdfs:
             combined_text += extract_text_from_pdf(pdf)
-    if company_name and issue_text and combined_text:
+    if (company_name or combined_text) and issue_text:
         raw_output = suggest_segments_from_text(company_name, combined_text, issue_text, num_segments_to_suggest)
 
         parsed_segments = []
