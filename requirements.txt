@@ -9,3 +9,4 @@ pdfplumber
 pandas
 certifi
 google-search-results
+reportlab
