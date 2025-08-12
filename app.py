@@ -1,6 +1,7 @@
 
 import streamlit as st
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
 import certifi
@@ -9,13 +10,11 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import pdfplumber
 import pandas as pd
-
+from generate_pdf_report import generate_pdf_report as build_pdf_report
 
 # === 👤 ログイン認証の追加 ===
-import streamlit as st
-
-USERNAME = "admin"
-PASSWORD = "DDmirai2025!"
+USERNAME = os.getenv("APP_USERNAME", os.getenv("STREAMLIT_USERNAME", "admin"))
+PASSWORD = os.getenv("APP_PASSWORD", os.getenv("STREAMLIT_PASSWORD", "DDmirai2025!"))
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -29,6 +28,8 @@ if not st.session_state.authenticated:
             st.session_state.authenticated = True
         else:
             st.error("ユーザー名またはパスワードが違います")
+    if USERNAME == "admin" and PASSWORD == "DDmirai2025!":
+        st.warning("デフォルトのログイン情報が使用されています。環境変数 APP_USERNAME / APP_PASSWORD を設定してください。")
     st.stop()  # ログインしてない限り以降は描画されない
 
 
@@ -37,10 +38,14 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o")
 
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; PersonaEvaluator/1.0; +https://example.com)",
+}
+
 # === 各種関数 ===
 def fetch_website_text(url):
     try:
-        res = requests.get(url, timeout=5, verify=certifi.where())
+        res = requests.get(url, timeout=5, verify=certifi.where(), headers=REQUEST_HEADERS)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         for tag in soup(["script", "style"]):
@@ -63,7 +68,7 @@ def fetch_all_texts(base_url, max_pages=5):
         if text:
             all_texts.append(text[:5000])
         try:
-            res = requests.get(current_url, timeout=5, verify=certifi.where())
+            res = requests.get(current_url, timeout=5, verify=certifi.where(), headers=REQUEST_HEADERS)
             soup = BeautifulSoup(res.text, 'html.parser')
             for a in soup.find_all("a", href=True):
                 href = a['href']
@@ -176,6 +181,34 @@ def evaluate_persona_score(persona_text, idea_name, idea_desc):
     )
     return res.choices[0].message.content
 
+
+def parse_evaluation_output(text: str):
+    score, reason = "", ""
+    try:
+        lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+        for l in lines:
+            if l.startswith("評価スコア"):
+                m = re.search(r"(\d+)", l)
+                if m:
+                    score = m.group(1)
+            if l.startswith("理由"):
+                reason = re.sub(r'^[-\s]*理由[:：]?\s*', '', l)
+        if not reason:
+            in_reason = False
+            reason_lines = []
+            for l in lines:
+                if l.startswith("理由"):
+                    in_reason = True
+                    reason_lines.append(re.sub(r'^[-\s]*理由[:：]?\s*', '', l))
+                    continue
+                if in_reason:
+                    reason_lines.append(l)
+            if reason_lines:
+                reason = "\n".join(reason_lines)
+    except Exception:
+        pass
+    return score, reason
+
 # === UI ===
 st.title("🧩 ペルソナ生成 ＋ 事業評価ツール")
 
@@ -198,6 +231,8 @@ if "personas" not in st.session_state:
     st.session_state.personas = []
 if "ideas" not in st.session_state:
     st.session_state.ideas = []
+if "eval_df" not in st.session_state:
+    st.session_state.eval_df = None
 
 if persona_mode == "ユーザーがセグメントを指定":
     st.session_state.segments = st.text_area("⑧ セグメントを1行ずつ入力", height=150)
@@ -275,9 +310,36 @@ if st.button("➕ アイデア追加"):
 # 評価ボタン表示
 if st.session_state.personas and st.session_state.ideas:
     if st.button("🧠 ペルソナごとの事業評価を実行"):
-        for persona in st.session_state.personas:
+        rows_by_idea = {}
+        for persona_index, persona in enumerate(st.session_state.personas, start=1):
             st.subheader(f"🎯 {persona['segment']} 向けペルソナの評価")
             for idea in st.session_state.ideas:
                 result = evaluate_persona_score(persona["text"], idea["name"], idea["desc"])
                 st.markdown(f"**📝 アイデア名：{idea['name']}**")
                 st.code(result)
+                score, reason = parse_evaluation_output(result)
+                row = rows_by_idea.setdefault(idea["name"], {"事業アイデア名": idea["name"]})
+                row[f"ペルソナ{persona_index}スコア"] = score
+                row[f"ペルソナ{persona_index}理由"] = reason
+        st.session_state.eval_df = pd.DataFrame(list(rows_by_idea.values()))
+        st.success("評価を集計しました。レポートの生成が可能です。")
+
+# PDFレポート生成
+if st.session_state.eval_df is not None and st.session_state.personas:
+    if st.button("📄 PDFレポートを生成"):
+        persona_texts = [p["text"] for p in st.session_state.personas]
+        pdf_buffer = build_pdf_report(
+            persona_texts=persona_texts,
+            df=st.session_state.eval_df,
+            company_name=company_name or "企業名未設定",
+            persona_images_bytes=[None] * len(persona_texts),
+            new_potential_personas_dict=None,
+            multi_axis_eval_dict=None,
+            persona_count=len(persona_texts)
+        )
+        st.download_button(
+            label="📥 レポートをダウンロード (PDF)",
+            data=pdf_buffer.getvalue(),
+            file_name="persona_idea_report.pdf",
+            mime="application/pdf"
+        )
