@@ -1,12 +1,9 @@
 openai
 python-dotenv
 streamlit
-openai
 requests
 beautifulsoup4
-python-dotenv
 pdfplumber
 pandas
 certifi
-google-search-results
 reportlab
